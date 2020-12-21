@@ -1,0 +1,24 @@
+# permissions for end users to edit furnaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: furnace-editor-role
+rules:
+- apiGroups:
+  - furnace.hyperfoil.io
+  resources:
+  - furnaces
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - furnace.hyperfoil.io
+  resources:
+  - furnaces/status
+  verbs:
+  - get

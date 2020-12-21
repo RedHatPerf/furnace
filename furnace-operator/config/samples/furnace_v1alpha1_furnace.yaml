@@ -1,0 +1,5 @@
+apiVersion: furnace.hyperfoil.io/v1alpha1
+kind: Furnace
+metadata:
+  name: furnace
+spec: {}

@@ -1,0 +1,15 @@
+# Run this from the furnace-app directory
+FROM fedora:rawhide
+RUN yum install -y bcc-tools git java jq kmod  less perf perl-open podman procps && \
+    yum clean all && \
+    rm -rf /var/cache/yum
+RUN git clone --single-branch https://github.com/brendangregg/FlameGraph /root/FlameGraph
+RUN mkdir -p /out/containers/storage && \
+    sed -i 's/driver = .*/driver = "vfs"/' /etc/containers/storage.conf && \
+    sed -i 's/graphroot = .*/graphroot = "\/out\/containers\/storage"/' /etc/containers/storage.conf
+COPY --chown=1001 target/quarkus-app/lib/ /root/lib/
+COPY --chown=1001 target/quarkus-app/*.jar /root/
+COPY --chown=1001 target/quarkus-app/app/ /root/app/
+COPY --chown=1001 target/quarkus-app/quarkus/ /root/quarkus/
+COPY src/main/resources/entrypoint.sh /root/
+ENTRYPOINT [ "/root/entrypoint.sh" ]
