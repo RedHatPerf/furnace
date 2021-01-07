@@ -73,7 +73,7 @@ The operator deploys a simple webserver that has three roles:
 
 ### 1. Mutating webhook
 
-The webhook watches all namespaces labeled with `furnace: enabled`. If a new pod is created its definition is agaub checked for label or annotation `furnace: enabled`. If both these conditions hold, the pod gets injected a sidecar container with Furnace.
+The webhook watches all namespaces labeled with `furnace: enabled`. If a new pod is created its definition is again checked for label or annotation `furnace: enabled`. If both these conditions hold, the pod gets injected a sidecar container with Furnace.
 
 ### 2. Proxy
 
