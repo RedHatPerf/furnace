@@ -53,6 +53,8 @@ oc label namespace my-ns furnace=enabled
 
 and then adjust the `deployment`/`deploymentconfig` or another resource (e.g. if you're spinning it up through another operator) so that the pod contains either label or annotation `furnace: enabled` as well.
 
+It's insufficient to label the pod after it is created; that would not trigger the mutating webhook and a furnace sidecar would not be injected.
+
 Since the sidecar requires elevated privileges, check out which service account your pod is using (most likely it's `default`) and then give it `anyuid` and `privileged` SCCs:
 
 ```sh
