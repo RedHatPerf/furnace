@@ -1,12 +1,12 @@
 # Run this from the furnace-app directory
-FROM fedora:rawhide
+FROM quay.io/fedora/fedora:34-x86_64
 RUN yum install -y bcc-tools git java jq kmod  less perf perl-open podman procps && \
     yum clean all && \
     rm -rf /var/cache/yum
 RUN git clone --single-branch https://github.com/brendangregg/FlameGraph /root/FlameGraph
-RUN mkdir -p /out/containers/storage && \
-    sed -i 's/driver = .*/driver = "vfs"/' /etc/containers/storage.conf && \
-    sed -i 's/graphroot = .*/graphroot = "\/out\/containers\/storage"/' /etc/containers/storage.conf
+RUN mkdir -p /containers/storage && mkdir /out
+COPY src/main/resources/registries.conf /etc/containers
+COPY src/main/resources/storage.conf /etc/containers/
 COPY --chown=1001 target/quarkus-app/lib/ /root/lib/
 COPY --chown=1001 target/quarkus-app/*.jar /root/
 COPY --chown=1001 target/quarkus-app/app/ /root/app/

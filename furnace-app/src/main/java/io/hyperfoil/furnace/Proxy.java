@@ -78,7 +78,7 @@ public class Proxy {
    @Path("registered")
    @NoCache
    public synchronized List<Registration> leases() {
-      return registered;
+      return new ArrayList<>(registered);
    }
 
    private synchronized ControllerClient controller(String namespace, String pod) {

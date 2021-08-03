@@ -9,6 +9,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -39,12 +41,18 @@ public class Controller {
    private static final Logger log = Logger.getLogger(Controller.class);
    private static final String POD_NAME = System.getenv("POD_NAME");
    private static final String POD_NAMESPACE = System.getenv("POD_NAMESPACE");
+   private static final String AUTOSTART = System.getenv("AUTOSTART");
+   private static final String AUTOSTART_DELAY = System.getenv("AUTOSTART_DELAY");
+   private static final String AUTOSTOP = System.getenv("AUTOSTOP");
+   private static final String AUTORESTART = System.getenv("AUTORESTART");
+   private static final String PROCESS_PATTERN = System.getenv("PROCESS_PATTERN");
 
    @Inject
    @RestClient
    ProxyClient proxy;
 
-   private final ScheduledExecutorService leaseExecutor = Executors.newScheduledThreadPool(1);
+   private final ScheduledExecutorService leaseExecutor = Executors.newSingleThreadScheduledExecutor();
+   private final ScheduledExecutorService timedExecutor = Executors.newSingleThreadScheduledExecutor();
    private final ExecutorService processingExecutor = Executors.newSingleThreadExecutor();
    private String mountPoint;
    private Process perfRecord;
@@ -55,13 +63,56 @@ public class Controller {
    private long recordStart, recordEnd;
 
    @PostConstruct
-   public synchronized void registerSelf() {
+   public synchronized void init() {
       if (System.getenv().get("FURNACE_SIDECAR") == null) {
          return;
+      }
+      if (AUTOSTART != null) {
+         if (checkAutostart()) {
+            log.info("Auto-starting recording");
+            Integer stop = null;
+            if (AUTOSTOP != null) {
+               try {
+                  stop = Integer.parseInt(AUTOSTOP);
+               } catch (NumberFormatException e) {
+                  log.error("Cannot parse AUTOSTOP=" + AUTOSTOP + " into integer");
+               }
+            } else if (AUTORESTART != null) {
+               Integer restart = null;
+               try {
+                  restart = Integer.parseInt(AUTORESTART);
+               } catch (NumberFormatException e) {
+                  log.errorf("Cannot parse AUTORESTART=%s", AUTORESTART);
+               }
+               if (restart != null) {
+                  timedExecutor.scheduleWithFixedDelay(() -> stop(true, 0, null, true).whenComplete(
+                              (ignore1, ignore2) -> start(null, true, 0, null, true, null)),
+                        restart, restart, TimeUnit.SECONDS);
+               }
+            }
+            Integer delay = null;
+            if (AUTOSTART_DELAY != null) {
+               try {
+                  delay = Integer.parseInt(AUTOSTART_DELAY);
+               } catch (NumberFormatException e) {
+                  log.errorf("Cannot parse AUTOSTART_DELAY=%s", AUTOSTART_DELAY);
+               }
+            }
+            if (delay != null) {
+               Integer myStop = stop;
+               timedExecutor.schedule(() -> start(myStop, true, 0, null, true, null), delay, TimeUnit.SECONDS);
+            } else {
+               start(stop, true, 0, null, true, null);
+            }
+         }
       }
       if (mountPoint == null) {
          mountMainImage(System.getenv("FURNACE_MAIN_IMAGE"));
       }
+      registerSelf();
+   }
+
+   private synchronized void registerSelf() {
       Proxy.Registration registration = new Proxy.Registration();
       registration.podName = POD_NAME;
       registration.namespace = POD_NAMESPACE;
@@ -83,6 +134,24 @@ public class Controller {
          log.error("Failed to register, retrying in 30 seconds", e);
          leaseExecutor.schedule(this::registerSelf, 30000, TimeUnit.MILLISECONDS);
       }
+   }
+
+   private boolean checkAutostart() {
+      for (String part : AUTOSTART.split(",")) {
+         int asteriskIndex = part.indexOf('*');
+         if (asteriskIndex < 0) {
+            if (POD_NAME.equals(part)) {
+               return true;
+            }
+         } else {
+            String prefix = part.substring(0, asteriskIndex);
+            String suffix = part.substring(asteriskIndex + 1);
+            if (POD_NAME.startsWith(prefix) && POD_NAME.endsWith(suffix)) {
+               return true;
+            }
+         }
+      }
+      return false;
    }
 
    private void mountMainImage(String mainImage) {
@@ -137,62 +206,102 @@ public class Controller {
 
    @POST
    @Path("start")
-   public synchronized void start() {
+   public synchronized void start(@QueryParam("stop") Integer stop,
+                                  @QueryParam("symfs") boolean symfs,
+                                  @QueryParam("width") int width,
+                                  @QueryParam("colors") String colors,
+                                  @QueryParam("inverted") @DefaultValue("true") boolean inverted,
+                                  @QueryParam("processPattern") String processPattern) {
       String status = status();
       if (!"idle".equals(status)) {
          throw new WebApplicationException("Already running: " + status);
       }
-      try {
-         File file = new File("/out/perf.svg");
-         if (file.exists()) {
-            Files.delete(file.toPath());
+      backupOldChart();
+      if (processPattern == null) {
+         processPattern = PROCESS_PATTERN;
+      }
+      List<String> command = new ArrayList<>(Arrays.asList("perf", "record", "-g", "-F", "99", "-o", "/out/perf.data"));
+      if (processPattern == null) {
+         command.add("-a");
+      } else {
+         try {
+            int rc = new ProcessBuilder().command("pgrep", processPattern)
+                  .inheritIO().redirectOutput(new File("/out/pids"))
+                  .start().waitFor();
+            if (rc != 0) {
+               log.errorf("Failed to find PIDs for pattern %s: %d", processPattern, rc);
+               return;
+            } else {
+               List<String> pids = Files.readAllLines(Paths.get("/out/pids"));
+               if (pids.isEmpty()) {
+                  log.errorf("No PIDs for pattern %s", processPattern);
+                  return;
+               }
+               log.infof("Recording data from pids %s", pids);
+               command.add("-p");
+               command.add(String.join(",", pids));
+            }
+         } catch (InterruptedException | IOException e) {
+            log.errorf(e, "Failed to find PIDs for pattern %s", processPattern);
          }
-      } catch (IOException e) {
-         error = "Cannot delete old chart.";
-         throw new WebApplicationException(error, e);
       }
       try {
-         perfRecord = new ProcessBuilder().command("perf", "record", "-g", "-a", "-F", "99", "-o", "/out/perf.data").inheritIO().start();
+         perfRecord = new ProcessBuilder().command(command).inheritIO().start();
          recordStart = System.currentTimeMillis();
       } catch (IOException e) {
          error = "Failed to start `perf record`";
          throw new WebApplicationException(error, e);
       }
+      if (stop != null) {
+         log.infof("The recording will automatically stop in %d seconds.", stop);
+         timedExecutor.schedule(() -> this.stop(symfs, width, colors, inverted), stop, TimeUnit.SECONDS);
+      }
    }
 
    @POST
    @Path("stop")
-   public synchronized void stop(@QueryParam("symfs") boolean symfs,
-         @QueryParam("width") int width, @QueryParam("colors") String colors,
-         @QueryParam("inverted") @DefaultValue("true") boolean inverted) {
+   public synchronized CompletionStage<Void> stop(@QueryParam("symfs") boolean symfs,
+                                                  @QueryParam("width") int width,
+                                                  @QueryParam("colors") String colors,
+                                                  @QueryParam("inverted") @DefaultValue("true") boolean inverted) {
       if (!"perf record".equals(status())) {
          throw new WebApplicationException("Not running: current status is: " + status());
       }
+      if (!perfRecord.isAlive()) {
+         throw new WebApplicationException("Already stopping...");
+      }
       recordEnd = System.currentTimeMillis();
       perfRecord.destroy();
-      try {
-         int rc = perfRecord.waitFor();
-         if (rc == 0 || rc == 143) {
-            List<String> command = new ArrayList<>(Arrays.asList("perf", "script", "-i", "/out/perf.data", "--kallsyms=/proc/kallsyms"));
-            if (symfs) {
-               command.add("--symfs=" + mountPoint);
+      CompletableFuture<Void> future = new CompletableFuture<>();
+      processingExecutor.submit(() -> {
+         try {
+            int rc = perfRecord.waitFor();
+            if (rc == 0 || rc == 143) {
+               List<String> command = new ArrayList<>(Arrays.asList("perf", "script", "-i", "/out/perf.data", "--kallsyms=/proc/kallsyms"));
+               if (symfs) {
+                  command.add("--symfs=" + mountPoint);
+               }
+               perfScript = new ProcessBuilder().command(command)
+                     .inheritIO().redirectOutput(new File("/out/perf.script")).start();
+               process(width, colors, inverted);
+            } else {
+               error = "Non-zero return code from `perf record`: " + rc;
+               future.completeExceptionally(new WebApplicationException(error));
             }
-            perfScript = new ProcessBuilder().command(command)
-                  .inheritIO().redirectOutput(new File("/out/perf.script")).start();
-            processingExecutor.submit(() -> process(width, colors, inverted));
-         } else {
-            error = "Non-zero return code from `perf record`: " + rc;
-            throw new WebApplicationException(error);
+         } catch (InterruptedException e) {
+            error = "Interrupted waiting for `perf record` to finish.";
+            future.completeExceptionally(new WebApplicationException(error, e));
+         } catch (IOException e) {
+            error = "Failed to start `perf script`";
+            future.completeExceptionally(new WebApplicationException(error, e));
+         } finally {
+            synchronized (this) {
+               perfRecord = null;
+            }
+            future.complete(null);
          }
-      } catch (InterruptedException e) {
-         error = "Interrupted waiting for `perf record` to finish.";
-         throw new WebApplicationException(error, e);
-      } catch (IOException e) {
-         error = "Failed to start `perf script`";
-         throw new WebApplicationException(error, e);
-      } finally {
-         perfRecord = null;
-      }
+      });
+      return future;
    }
 
    private synchronized void process(int width, String colors, boolean inverted) {
@@ -209,6 +318,24 @@ public class Controller {
          return;
       } finally {
          perfScript = null;
+      }
+      String[] scripts = new File("/scripts").list();
+      if (scripts != null) {
+         Arrays.sort(scripts);
+         for (String filename : scripts) {
+            if (filename.startsWith(".") || !filename.endsWith(".sh")) {
+               log.infof("Ignoring non-shell script %s", filename);
+               continue;
+            }
+            File file = new File("/scripts", filename);
+            if (file.isHidden() || !file.isFile() || !file.canExecute()) continue;
+            log.infof("Executing script %s", file.toString());
+            try {
+               Runtime.getRuntime().exec("bash -c " + file.toString()).waitFor();
+            } catch (IOException | InterruptedException e) {
+               log.error("Failed to execute script", e);
+            }
+         }
       }
       try {
          stackCollapse = new ProcessBuilder().command("/root/FlameGraph/stackcollapse-perf.pl", "/out/perf.script")
@@ -251,12 +378,15 @@ public class Controller {
          command.add("--title");
          command.add(POD_NAMESPACE + "/" + POD_NAME + " " + df.format(startDate) + " - " + df.format(endDate));
          command.add("/out/perf.collapsed");
+         File target = new File("/out/perf.svg");
          flamegraph = new ProcessBuilder().command(command)
-               .inheritIO().redirectOutput(new File("/out/perf.svg")).start();
+               .inheritIO().redirectOutput(target).start();
          int rc4 = flamegraph.waitFor();
          if (rc4 != 0) {
             error = "Non-zero return code from flamegraph.pl: " + rc4;
             log.error(error);
+         } else {
+            log.infof("Written flamegraph to %s", target.toString());
          }
       } catch (InterruptedException e) {
          error = "Interrupted waiting for flamegraph.pl";
@@ -266,6 +396,25 @@ public class Controller {
          log.error(error, e);
       } finally {
          flamegraph = null;
+      }
+   }
+
+   private void backupOldChart() {
+      File target = new File("/out/perf.svg");
+      if (!target.exists()) {
+         return;
+      }
+      int counter = 0;
+      File backup = new File("/out/perf." + counter + ".svg");
+      while (backup.exists()) {
+         ++counter;
+         backup = new File("/out/perf." + counter + ".svg");
+      }
+      try {
+         log.infof("Backing up %s to %s", target.toString(), backup.toString());
+         Files.move(target.toPath(), backup.toPath());
+      } catch (IOException e) {
+         log.errorf(e, "Failed to backup old chart to %s", backup.toString());
       }
    }
 

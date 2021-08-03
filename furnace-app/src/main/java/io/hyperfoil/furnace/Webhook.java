@@ -5,6 +5,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 import javax.annotation.PostConstruct;
 import javax.ws.rs.Consumes;
@@ -21,11 +24,14 @@ import io.vertx.core.json.JsonObject;
 @Path("/webhook")
 public class Webhook {
     private static final Logger log = Logger.getLogger(Webhook.class);
-    private static final String FURNACE_IMAGE = "quay.io/rvansa/furnace:latest";
+    private static final String FURNACE_IMAGE = "quay.io/rvansa/furnace-app:latest";
     private static final String SERVICE_NAME = System.getenv("SERVICE_NAME");
     private static final String POD_NAME = System.getenv("POD_NAME");
     private static final String POD_NAMESPACE = System.getenv("POD_NAMESPACE");
+    private static final boolean ADD_KERNEL_SRC = Util.getBooleanEnv("ADD_KERNEL_SRC", true);
+    private static final String CONTAINER_STORAGE_NFS = System.getenv("CONTAINER_STORAGE_NFS");
     private String keystore;
+    private final Map<String, String> images = new HashMap<>();
 
     @PostConstruct
     public void init() {
@@ -44,6 +50,28 @@ public class Webhook {
         } catch (IOException e) {
             log.error("Failed to read keystore", e);
         }
+
+        java.nio.file.Path imagesPath = Paths.get("/var/images");
+        if (Files.isRegularFile(imagesPath)) {
+            try {
+                for (String line : Files.readAllLines(imagesPath)) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    int firstSpace = line.indexOf(' ');
+                    if (firstSpace < 0) {
+                        log.error("Invalid image record " + line);
+                    }
+                    String original = line.substring(0, firstSpace);
+                    String replace = line.substring(firstSpace + 1).trim();
+                    if (replace.isEmpty()) {
+                        log.error("Invalid image replacement " + line);
+                    }
+                    images.put(original, replace);
+                }
+            } catch (IOException e) {
+                log.error("Failed to read images alternatives");
+            }
+        }
     }
 
     @POST
@@ -51,8 +79,25 @@ public class Webhook {
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
     public JsonObject mutate(JsonObject request) {
+        return mutate(request, false);
+    }
+
+    @POST
+    @Path("always-mutate")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public JsonObject alwaysMutate(JsonObject request) {
+        return mutate(request, true);
+    }
+
+    private JsonObject mutate(JsonObject request, boolean alwaysInject) {
         JsonObject pod = request.getJsonObject("request").getJsonObject("object");
-        JsonArray patch = createPatch(pod);
+        log.infof("Inspecting pod %s/%s (%s) with these containers: %s",
+              pod.getJsonObject("metadata").getString("namespace"),
+              pod.getJsonObject("metadata").getString("name"),
+              pod.getJsonObject("metadata"),
+              pod.getJsonObject("spec").getJsonArray("containers").stream().map(c -> ((JsonObject) c).getString("name")).collect(Collectors.toList()));
+        JsonArray patch = createPatch(pod, alwaysInject);
         JsonObject review = new JsonObject();
         JsonObject response = new JsonObject();
         response.put("apiVersion", "admission.k8s.io/v1beta1");
@@ -65,34 +110,71 @@ public class Webhook {
         return response;
     }
 
-    private JsonArray createPatch(JsonObject pod) {
+    private JsonArray createPatch(JsonObject pod, boolean alwaysInject) {
         JsonArray patch = new JsonArray();
         addToPatch(patch, "/metadata/annotations", new JsonObject().put("furnace.inspected", "true"));
         JsonObject metadata = pod.getJsonObject("metadata");
         JsonObject annotations = metadata.getJsonObject("annotations");
         JsonObject labels = metadata.getJsonObject("labels");
-        if (annotations == null || !isEnabled(annotations.getValue("furnace")) && (labels == null || !isEnabled(labels.getValue("furnace")))) {
+        JsonObject spec = pod.getJsonObject("spec");
+        boolean inject = alwaysInject;
+        if (annotations != null && isEnabled(annotations.getValue("furnace"))) {
+            inject = true;
+        } else if (labels != null && isEnabled(labels.getValue("furnace"))) {
+            inject = true;
+        }
+        for (Object c : spec.getJsonArray("containers")) {
+            if (c instanceof JsonObject && "furnace".equals(((JsonObject) c).getString("name"))) {
+                // already has the sidecar - e.g. it's a debug container
+                inject = false;
+            }
+        }
+        if (!inject) {
             return patch;
         }
         JsonArray volumes = new JsonArray();
-        JsonArray imagePullSecrets = pod.getJsonObject("spec").getJsonArray("imagePullSecrets");
+        JsonArray imagePullSecrets = spec.getJsonArray("imagePullSecrets");
         JsonObject sidecar = new JsonObject();
         sidecar.put("name", "furnace");
         sidecar.put("image", FURNACE_IMAGE);
+        sidecar.put("imagePullPolicy", "Always");
         sidecar.put("ports", new JsonArray().add(new JsonObject().put("containerPort", 12380)));
-        sidecar.put("securityContext", new JsonObject().put("privileged", true));
+        sidecar.put("securityContext", new JsonObject().put("privileged", true).put("runAsUser", 0));
         sidecar.put("startupProbe", new JsonObject()
               .put("failureThreshold", 1000)
               .put("httpGet", new JsonObject().put("port", 12380).put("path", "/controller/ready")));
         JsonArray volumeMounts = new JsonArray();
         volumes.add(new JsonObject().put("name", "output").put("emptyDir", new JsonObject()));
-        addMount(volumeMounts, "output", "/out");
+        addMount(volumeMounts, "output", "/out", false);
         addHostPath(volumes, "kernel-modules", "/lib/modules");
-        addMount(volumeMounts, "kernel-modules", "/lib/modules");
+        addMount(volumeMounts, "kernel-modules", "/lib/modules", true);
         addHostPath(volumes, "kernel-debug", "/sys/kernel/debug");
-        addMount(volumeMounts, "kernel-debug", "/sys/kernel/debug");
-        addHostPath(volumes, "kernel-src", "/usr/src/kernels");
-        addMount(volumeMounts, "kernel-src", "/usr/src/kernels");
+        addMount(volumeMounts, "kernel-debug", "/sys/kernel/debug", true);
+        volumes.add(new JsonObject().put("name", "scripts").put("configMap",
+              new JsonObject().put("name", "furnace-scripts").put("optional", true).put("defaultMode", 0777)
+        ));
+        addMount(volumeMounts, "scripts", "/scripts", true);
+        JsonObject containersStorage = new JsonObject().put("name", "containers-storage");
+        if (CONTAINER_STORAGE_NFS == null) {
+            containersStorage.put("emptyDir", new JsonObject());
+        } else {
+            int lastColon = CONTAINER_STORAGE_NFS.lastIndexOf(':');
+            String server, path;
+            if (lastColon < 0) {
+                server = CONTAINER_STORAGE_NFS;
+                path = "/";
+            } else {
+                server = CONTAINER_STORAGE_NFS.substring(0, lastColon);
+                path = CONTAINER_STORAGE_NFS.substring(lastColon + 1);
+            }
+            containersStorage.put("nfs", new JsonObject().put("server", server).put("path", path));
+        }
+        volumes.add(containersStorage);
+        addMount(volumeMounts, "containers-storage", "/containers/storage", false);
+        if (ADD_KERNEL_SRC) {
+            addHostPath(volumes, "kernel-src", "/usr/src/kernels");
+            addMount(volumeMounts, "kernel-src", "/usr/src/kernels", true);
+        }
         JsonArray sources = new JsonArray();
         if (imagePullSecrets != null && !imagePullSecrets.isEmpty()) {
             for (Object ps : imagePullSecrets) {
@@ -107,7 +189,7 @@ public class Webhook {
             }
             volumes.add(new JsonObject().put("name", "pull-secrets").put("projected",
                   new JsonObject().put("defaultMode", 256).put("sources", sources)));
-            addMount(volumeMounts, "pull-secrets", "/etc/pull-secrets/");
+            addMount(volumeMounts, "pull-secrets", "/etc/pull-secrets/", true);
         }
         addHostPath(volumes, "var-lib-kubelet", "/var/lib/kubelet");
         volumeMounts.add(new JsonObject()
@@ -116,7 +198,11 @@ public class Webhook {
               .put("mountPath", "/etc/kubelet.config.json")
               .put("readOnly", true));
 
-        String image = pod.getJsonObject("spec").getJsonArray("containers").getJsonObject(0).getString("image");
+        String image = spec.getJsonArray("containers").getJsonObject(0).getString("image");
+        if (images.containsKey(image)) {
+            // replace images to avoid DockerHub limits
+            image = images.get(image);
+        }
         JsonArray env = new JsonArray();
         addEnv(env, "FURNACE_SIDECAR", "true");
         addEnv(env, "FURNACE_MAIN_IMAGE", image);
@@ -128,13 +214,23 @@ public class Webhook {
         addEnv(env, "PROXY_CLIENT_MP_REST_TRUSTSTORE", "file:/root/keystore.jks");
         addEnv(env, "PROXY_CLIENT_MP_REST_TRUSTSTOREPASSWORD", "changeit");
         addEnv(env, "KEYSTORE", keystore);
+        addEnvFromConfigMap(env, "AUTOSTART", "autostart");
+        addEnvFromConfigMap(env, "AUTOSTART_DELAY", "autostartDelay");
+        addEnvFromConfigMap(env, "AUTOSTOP", "autostop");
+        addEnvFromConfigMap(env, "AUTORESTART", "autorestart");
+        addEnvFromConfigMap(env, "PROCESS_PATTERN", "processPattern");
 
         sidecar.put("volumeMounts", volumeMounts);
         sidecar.put("env", env);
         addToPatch(patch, "/spec/containers/-", sidecar);
         addToPatch(patch, "/spec/shareProcessNamespace", true);
-        for (Object volume : volumes) {
-            addToPatch(patch, "/spec/volumes/-", volume);
+        addToPatch(patch, "/spec/securityContext/runAsNonRoot", false);
+        if (spec.containsKey("volumes")) {
+            for (Object volume : volumes) {
+                addToPatch(patch, "/spec/volumes/-", volume);
+            }
+        } else {
+            addToPatch(patch, "/spec/volumes", volumes);
         }
         return patch;
     }
@@ -144,12 +240,20 @@ public class Webhook {
               new JsonObject().put("fieldRef", new JsonObject().put("fieldPath", path))));
     }
 
-    private void addMount(JsonArray volumeMounts, String name, String path) {
-        volumeMounts.add(new JsonObject().put("name", name).put("mountPath", path));
+    private void addEnvFromConfigMap(JsonArray env, String name, String key) {
+        env.add(new JsonObject().put("name", name).put("valueFrom",
+              new JsonObject().put("configMapKeyRef",
+                    new JsonObject().put("name", "furnace-config").put("key", key).put("optional", true))));
+    }
+
+    private void addMount(JsonArray volumeMounts, String name, String path, boolean readOnly) {
+        volumeMounts.add(new JsonObject().put("name", name).put("mountPath", path).put("readOnly", readOnly));
     }
 
     private void addHostPath(JsonArray volumes, String name, String path) {
-        volumes.add(new JsonObject().put("name", name).put("hostPath", new JsonObject().put("path", path)));
+        volumes.add(new JsonObject().put("name", name).put("hostPath",
+              new JsonObject().put("path", path).put("type", "Directory")
+        ));
     }
 
     private void addEnv(JsonArray env, String name, String value) {
