@@ -106,17 +106,10 @@ opm index add --bundles quay.io/rvansa/furnace-operator-bundle:latest --tag quay
 podman push quay.io/rvansa/furnace-index
 ```
 
-Build the webhook/proxy/UI with
+You can use single image for both the sidecar and the webhook/proxy/UI. Build it with
 
 ```sh
 cd furnace-app
-./mvnw package -Dquarkus.container-image.build=true -Dquarkus.container-image.push=true
-```
-
-Prepare the sidecar image with:
-```sh
-cd furnace-app
+./mvnw package
 podman build -t quay.io/rvansa/furnace -f src/main/docker/Dockerfile.furnace . && podman push quay.io/rvansa/furnace
 ```
-
-Note: since the sidecar contains the application as well it must be built before the sidecar.
