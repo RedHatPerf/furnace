@@ -118,9 +118,9 @@ public class Webhook {
         JsonObject labels = metadata.getJsonObject("labels");
         JsonObject spec = pod.getJsonObject("spec");
         boolean inject = alwaysInject;
-        if (annotations != null && isEnabled(annotations.getValue("furnace"))) {
+        if (annotations != null && isEnabled(annotations.getValue("furnace"), false)) {
             inject = true;
-        } else if (labels != null && isEnabled(labels.getValue("furnace"))) {
+        } else if (labels != null && isEnabled(labels.getValue("furnace"), false)) {
             inject = true;
         }
         for (Object c : spec.getJsonArray("containers")) {
@@ -131,6 +131,12 @@ public class Webhook {
         }
         if (!inject) {
             return patch;
+        }
+        boolean pull = true;
+        if (annotations != null && !isEnabled(annotations.getValue("furnace.pull"), true)) {
+            pull = false;
+        } else if (labels != null && !isEnabled(labels.getValue("furnace.pull"), true)) {
+            pull = false;
         }
         JsonArray volumes = new JsonArray();
         JsonArray imagePullSecrets = spec.getJsonArray("imagePullSecrets");
@@ -214,6 +220,7 @@ public class Webhook {
         addEnv(env, "PROXY_CLIENT_MP_REST_TRUSTSTORE", "file:/root/keystore.jks");
         addEnv(env, "PROXY_CLIENT_MP_REST_TRUSTSTOREPASSWORD", "changeit");
         addEnv(env, "KEYSTORE", keystore);
+        addEnv(env, "PULL_IMAGE", String.valueOf(pull));
         addEnvFromConfigMap(env, "AUTOSTART", "autostart");
         addEnvFromConfigMap(env, "AUTOSTART_DELAY", "autostartDelay");
         addEnvFromConfigMap(env, "AUTOSTOP", "autostop");
@@ -264,7 +271,7 @@ public class Webhook {
         patch.add(new JsonObject().put("op", "add").put("path", path).put("value", value));
     }
 
-    private boolean isEnabled(Object annotation) {
+    private boolean isEnabled(Object annotation, boolean defaultValue) {
         if (annotation instanceof String) {
             String str = (String) annotation;
             return "enable".equalsIgnoreCase(str) ||
@@ -274,7 +281,7 @@ public class Webhook {
         } else if (annotation instanceof Boolean) {
             return (Boolean) annotation;
         } else {
-            return false;
+            return defaultValue;
         }
     }
 }

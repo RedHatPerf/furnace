@@ -46,6 +46,7 @@ public class Controller {
    private static final String AUTOSTOP = System.getenv("AUTOSTOP");
    private static final String AUTORESTART = System.getenv("AUTORESTART");
    private static final String PROCESS_PATTERN = System.getenv("PROCESS_PATTERN");
+   private static final String PULL_IMAGE = System.getenv("PULL_IMAGE");
 
    @Inject
    @RestClient
@@ -155,6 +156,19 @@ public class Controller {
    }
 
    private void mountMainImage(String mainImage) {
+      if ("false".equals(PULL_IMAGE)) {
+         log.infof("Pulling image %s disabled.", mainImage);
+         return;
+      }
+      File lockFile = new File("/containers/storage/vfs-images/images.lock");
+      if (!lockFile.exists()) {
+         lockFile.getParentFile().mkdirs();
+         try {
+            lockFile.createNewFile();
+         } catch (IOException e) {
+            log.error("Failed to initialize VFS images lock file");
+         }
+      }
       try {
          int rc = new ProcessBuilder().command("podman", "run", "-d", "--rm", "--name", "main-container",
                "--cgroup-manager=cgroupfs", "--entrypoint", "tail", mainImage, "-f", "/dev/null")
@@ -186,7 +200,7 @@ public class Controller {
    @GET
    @Path("ready")
    public Response ready() {
-      return mountPoint == null ? Response.status(404).build() : Response.ok().build();
+      return mountPoint != null || "false".equals(PULL_IMAGE) ? Response.ok().build() : Response.status(404).build();
    }
 
    @GET
@@ -331,7 +345,7 @@ public class Controller {
             if (file.isHidden() || !file.isFile() || !file.canExecute()) continue;
             log.infof("Executing script %s", file.toString());
             try {
-               Runtime.getRuntime().exec("bash -c " + file.toString()).waitFor();
+               Runtime.getRuntime().exec("bash -c " + file).waitFor();
             } catch (IOException | InterruptedException e) {
                log.error("Failed to execute script", e);
             }

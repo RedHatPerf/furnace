@@ -1,7 +1,7 @@
 # Current Operator version
 VERSION ?= 0.0.1
 # Default bundle image tag
-BUNDLE_IMG ?= controller-bundle:$(VERSION)
+BUNDLE_IMG ?= quay.io/rvansa/furnace-operator-bundle:$(VERSION)
 # Options for 'bundle-build'
 ifneq ($(origin CHANNELS), undefined)
 BUNDLE_CHANNELS := --channels=$(CHANNELS)
@@ -12,7 +12,7 @@ endif
 BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNELS) $(BUNDLE_DEFAULT_CHANNEL)
 
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= quay.io/rvansa/furnace-operator:$(VERSION)
 
 all: docker-build
 
@@ -69,8 +69,8 @@ ifeq (, $(shell which ansible-operator 2>/dev/null))
 	@{ \
 	set -e ;\
 	mkdir -p bin ;\
-	curl -LO https://github.com/operator-framework/operator-sdk/releases/download/v1.3.0/ansible-operator-v1.3.0-$(ARCHOPER)-$(OSOPER) ;\
-	mv ansible-operator-v1.3.0-$(ARCHOPER)-$(OSOPER) ./bin/ansible-operator ;\
+	curl -LO https://github.com/operator-framework/operator-sdk/releases/download/v1.3.0/ansible-operator_$(OS)_$(ARCH) ;\
+	mv ansible-operator_$(OS)_$(ARCH) ./bin/ansible-operator ;\
 	chmod +x ./bin/ansible-operator ;\
 	}
 ANSIBLE_OPERATOR=$(realpath ./bin/ansible-operator)

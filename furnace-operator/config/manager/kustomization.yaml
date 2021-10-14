@@ -5,3 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: quay.io/rvansa/furnace-operator
+  newTag: 0.0.1

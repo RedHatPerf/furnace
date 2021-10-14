@@ -5,4 +5,4 @@ resources:
 - group: furnace
   kind: Furnace
   version: v1alpha1
-version: 3-alpha
+version: "3"
